@@ -1,0 +1,1592 @@
+#!/usr/bin/env python
+# coding: utf-8
+if SIMPLEX_MIP_FLAG == 'SIMPLEX':
+    import warnings
+    import pandas as pd
+    import numpy as np
+    import scipy
+    import time
+    import sys
+    from scipy.optimize import linprog, dual_annealing, OptimizeWarning
+    from scipy.sparse import csr_matrix, vstack, hstack, block_diag
+
+    if len(data.index)==0:
+        result = pd.DataFrame(columns=['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType', 'Symbol',
+                                       'quantity', 'unit_price', 'Haircut_Total', 'SkippedFromOptimizer', 'Q_ApA',
+                                       'Q_AtoM'])
+        print("!!!!!!!!!EMPTY INPUT AGGREGATION!!!!!!!!!")
+        Optimization_Results = result
+    else:
+        np.seterr(divide='ignore', invalid='ignore')
+        warnings.simplefilter("ignore", OptimizeWarning)
+
+        SECTION_J_COEF = 0.15
+        additional_j_long = SECTION_J_COEF * sec_J['market_value_long'].sum()
+        additional_j_short = SECTION_J_COEF * np.abs(sec_J['market_value_short'].sum())
+
+        class_count, product_count, portfolio_count = (0, 0, 0)
+        class_product_haircut, portfolio_haircut = (0, 0)
+        additional_haircut = additional_j_long + additional_j_short - 0.25 * max(additional_j_long, additional_j_short)
+
+        # skip optimization for classes wo options
+        CLASS_WO_OPT_TO_J_FLAG = 10
+        if '1' in str(CLASS_WO_OPT_TO_J_VAR):
+            CLASS_WO_OPT_TO_J_FLAG = 1
+        elif '2' in str(CLASS_WO_OPT_TO_J_VAR):
+            CLASS_WO_OPT_TO_J_FLAG = 2
+        elif '3' in str(CLASS_WO_OPT_TO_J_VAR):
+            CLASS_WO_OPT_TO_J_FLAG = 3
+        elif 'ALL' in str(CLASS_WO_OPT_TO_J_VAR):
+            CLASS_WO_OPT_TO_J_FLAG = 1
+
+        print('SYS python version', sys.version.split(' ')[0])
+        print('SYS pandas version', pd.__version__)
+        print('SYS numpy version', np.__version__)
+        print('SYS scipy version', scipy.__version__)
+        print()
+
+
+        ##################################################################################################################
+        ##################################################################################################################
+        def data_split(data):
+            options = data[data['SecType'] == 'OPT']
+            equities = data[data['SecType'] != 'OPT']
+            options_q = np.array(options['quantity'])
+            equities_q = np.array(equities['quantity'])
+            equities_price = np.array(equities['unit_price'])
+            options_pp = np.array(options.filter(regex='PLV', axis=1))
+            equities_pp = np.array(equities.filter(regex='PLV', axis=1))
+            classes = np.array(data['ClassGrID'])
+            equity_classes = np.array(equities['ClassGrID'])
+            options_classes = np.array(options['ClassGrID'])
+            min_haircut = data['ClassGrMinHaircut'].sum()
+            product_coef = data['PrdGr_Offset'].max()
+            if np.isnan(product_coef) or product_coef == 0: product_coef = 1
+            return options, equities, options_q, equities_q, equities_price, options_pp, equities_pp, classes, equity_classes, options_classes, min_haircut, product_coef
+
+
+        def simplex_class(options, options_q, options_pp, equities, equities_q,
+                          equities_pp, equities_price, section_j_coef, min_haircut,
+                          additional_j_long, additional_j_short):
+
+            options_number = len(options_q)
+            equities_number = len(equities_q)
+
+            # objective function
+            c = [1, ] + equities_number * [0] + list(equities_price * section_j_coef)
+
+            # A_ub
+            # if q_cusip1 > 0 then -1*PP1 else PP1 end
+            equities_q_neg = np.where(equities_q > 0, (-1), 1)
+            equities_pp_neg = np.transpose(equities_pp) * equities_q_neg
+            # equities_pp_neg = equities_pp_neg * equities_q
+            A_ub = np.zeros(shape=(11, 1 + 2 * equities_number))
+            for i in range(10):
+                A_ub[i] = np.concatenate([np.array([-1]),
+                                          equities_pp_neg[i],
+                                          np.array(equities_number * [0])])
+            # add Cmin
+            A_ub[10] = np.array([-1, ] + equities_number * 2 * [0])
+
+            # b_ub
+            b_ub = np.array([])
+            for i in range(10):
+                temp_value = (options_pp[:, i] * options_q).sum()
+                b_ub = np.append(b_ub, temp_value)
+            # add Cmin
+            b_ub = np.append(b_ub, (-1) * min_haircut)
+
+            # A_eq and b_eq
+            A_eq = np.column_stack((np.array([0] * equities_number),
+                                    np.diag([1] * equities_number),
+                                    np.diag([1] * equities_number)))
+            b_eq = abs(equities_q)
+
+            bounds = [(0, None), ] + [(0, None)] * equities_number * 2
+
+            # section J
+            A_ub_J_long = np.vstack(([0, ] + equities_number * [0] + list(
+                np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * -1),
+                                     [0, ] + equities_number * [0] + list(
+                                         np.sign(equities_q * -1).clip(min=0) * equities_price * section_j_coef * -1),
+                                     [0, ] + equities_number * [0] + list(
+                                         np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * 0.25 * -1),
+                                     [0, ] + equities_number * [0] + list(
+                                         np.sign(equities_q * -1) * equities_price * section_j_coef)))
+
+            A_ub_J_short = np.vstack(([0, ] + equities_number * [0] + list(
+                np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * -1),
+                                      [0, ] + equities_number * [0] + list(
+                                          np.sign(equities_q * -1).clip(min=0) * equities_price * section_j_coef * -1),
+                                      [0, ] + equities_number * [0] + list(np.sign(equities_q * -1).clip(
+                                          min=0) * equities_price * section_j_coef * 0.25 * -1),
+                                      [0, ] + equities_number * [0] + list(
+                                          np.sign(equities_q) * equities_price * section_j_coef)))
+
+            b_ub_J_long = np.array([additional_j_long,
+                                    abs(additional_j_short),
+                                    0.25 * additional_j_long,
+                                    additional_j_long - abs(additional_j_short)])
+
+            b_ub_J_short = np.array([additional_j_long,
+                                     abs(additional_j_short),
+                                     0.25 * additional_j_short,
+                                     abs(additional_j_short) - additional_j_long])
+
+            return c, csr_matrix(A_ub), b_ub, csr_matrix(A_eq), b_eq, bounds, equities_number, csr_matrix(
+                A_ub_J_long), b_ub_J_long, csr_matrix(A_ub_J_short), b_ub_J_short
+
+
+        def simplex_product(options, options_q, options_pp, equities, equities_q,
+                            equities_pp, equities_price, section_j_coef, min_haircut,
+                            classes, equity_classes, options_classes,
+                            additional_j_long, additional_j_short):
+
+            options_number = len(options_q)
+            equities_number = len(equities_q)
+            classes_number = len(np.unique(classes))
+
+            class_equity_dict = {}
+            for cl in np.unique(equity_classes):
+                class_equity_dict[cl] = [i for i, x in enumerate(equity_classes) if x == cl]
+
+            class_option_dict = {}
+            for cl in np.unique(options_classes):
+                class_option_dict[cl] = [i for i, x in enumerate(options_classes) if x == cl]
+
+            # objective function
+            c = [1, ] + classes_number * 10 * [0] + equities_number * [0] + list(equities_price * section_j_coef)
+
+            # A_ub part 1
+            A_ub_1 = []
+            # 10 arrays for 10 PP
+            for i in range(10):
+                temp = [-1, ] + classes_number * i * [0] \
+                       + classes_number * [1] \
+                       + classes_number * (9 - i) * [0] \
+                       + equities_number * 2 * [0]
+                A_ub_1.append(temp)
+
+            # add Cmin
+            A_ub_1.append([-1, ] + classes_number * 10 * [0] + equities_number * 2 * [0])
+
+            # A_ub part 2
+            A_ub_2 = []
+            for k in [product_coef, 1]:
+                for cl, cl_name in enumerate(np.unique(classes)):
+                    for i, pp in enumerate(np.transpose(equities_pp)):
+                        t1 = [0] * classes_number * 10
+                        t1[i * classes_number + cl] = -1
+
+                        t2 = [0] * equities_number
+                        if cl_name in class_equity_dict:
+                            for pos in class_equity_dict[cl_name]:
+                                sign = 1 if equities_q[pos] < 0 else -1
+                                t2[pos] = float(pp[pos] * sign * k)
+
+                        t3 = [0] * equities_number
+
+                        temp = [0, ] + t1 + t2 + t3
+                        A_ub_2.append(temp)
+
+            # A_ub total
+            A_ub = A_ub_1 + A_ub_2
+
+            # b_ub
+            b_ub = [0] * 10 + [(-1) * min_haircut, ]
+
+            for k in [product_coef, 1]:
+                for cl, cl_name in enumerate(np.unique(classes)):
+                    for i in range(10):
+                        temp_value = 0
+                        if cl_name in class_option_dict:
+                            for pos in class_option_dict[cl_name]:
+                                temp_value += (options_pp[pos][i] * options_q[pos]).sum() * k
+                        b_ub = np.append(b_ub, temp_value)
+
+            # A_eq and b_eq
+            A_eq = np.column_stack((np.zeros([equities_number, classes_number * 10 + 1]),
+                                    np.diag([1] * equities_number),
+                                    np.diag([1] * equities_number)))
+            b_eq = abs(equities_q)
+
+            bounds = [(0, None)] + \
+                     [(None, None) for i in range(10 * classes_number)] + \
+                     [(0, None) for i in range(2 * equities_number)]
+
+            # section J
+            A_ub_J_long = np.vstack(([0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * -1),
+                                     [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                         np.sign(equities_q * -1).clip(min=0) * equities_price * section_j_coef * -1),
+                                     [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                         np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * 0.25 * -1),
+                                     [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                         np.sign(equities_q * -1) * equities_price * section_j_coef)))
+
+            A_ub_J_short = np.vstack(([0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * -1),
+                                      [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                          np.sign(equities_q * -1).clip(min=0) * equities_price * section_j_coef * -1),
+                                      [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                          np.sign(equities_q * -1).clip(
+                                              min=0) * equities_price * section_j_coef * 0.25 * -1),
+                                      [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                          np.sign(equities_q) * equities_price * section_j_coef)))
+
+            b_ub_J_long = np.array([additional_j_long,
+                                    abs(additional_j_short),
+                                    0.25 * additional_j_long,
+                                    additional_j_long - abs(additional_j_short)])
+
+            b_ub_J_short = np.array([additional_j_long,
+                                     abs(additional_j_short),
+                                     0.25 * additional_j_short,
+                                     abs(additional_j_short) - additional_j_long])
+
+            return c, csr_matrix(A_ub), b_ub, csr_matrix(A_eq), b_eq, bounds, classes_number, equities_number, csr_matrix(
+                A_ub_J_long), b_ub_J_long, csr_matrix(A_ub_J_short), b_ub_J_short
+
+
+        def haircut_minimize(x, inp_pl_values, inp_product_offset_coef, inp_portfolio_offset_coef,
+                             inp_min_haircut, inp_quantity, inp_price, class_prodact_dict, prodact_coef_dict,
+                             inp_class, inp_class_number, additional_j_long, additional_j_short):
+
+            scenarios = inp_pl_values * x[:, np.newaxis]
+
+            # Class
+            class_scenarios = [np.zeros(10)] * inp_class_number
+            class_scenarios_dict = {i: 0 for i in set(inp_class)}
+            for i, cl in enumerate(inp_class):
+                class_scenarios_dict[cl] += scenarios[i]
+            class_scenarios = np.array(list(class_scenarios_dict.values()))
+            classes = list(class_scenarios_dict.keys())
+            inp_products_all = [class_prodact_dict[cl] for cl in classes]
+            seen = set()
+            inp_products = sorted([x for x in inp_products_all if x not in seen and not seen.add(x)])
+
+            inp_product_number = len(inp_products)
+            inp_product_offset_coef = [prodact_coef_dict[pr] for pr in inp_products]
+
+            # Product
+            product_gain = [np.zeros(10)] * inp_product_number
+            product_loss = [np.zeros(10)] * inp_product_number
+            product_offset = [np.zeros(10)] * inp_product_number
+
+            product_gain_dict = {i: 0 for i in sorted(set(inp_products))}
+            product_loss_dict = {i: 0 for i in sorted(set(inp_products))}
+            for i, pr in enumerate(inp_products_all):
+                product_gain_dict[pr] += class_scenarios[i].clip(min=0)
+                product_loss_dict[pr] += class_scenarios[i].clip(max=0)
+            product_gain = np.array(list(product_gain_dict.values()))
+            product_loss = np.array(list(product_loss_dict.values()))
+
+            for i, coef in enumerate(inp_product_offset_coef):
+                product_offset[i] = np.where(product_gain[i] > np.abs(product_loss[i] / coef),
+                                             product_gain[i] - np.abs(product_loss[i] / coef),
+                                             product_gain[i] * coef + product_loss[i])
+
+            # Portfolio
+            portfolio_gain = np.array(product_offset).clip(min=0).sum(axis=0)
+            portfolio_loss = np.array(product_offset).clip(max=0).sum(axis=0)
+
+            portfolio_offset = np.where(portfolio_gain > np.abs(portfolio_loss / inp_portfolio_offset_coef),
+                                        portfolio_gain - np.abs(portfolio_loss / inp_portfolio_offset_coef),
+                                        portfolio_gain * inp_portfolio_offset_coef + portfolio_loss)
+            haircut = abs(min(0, np.amin(portfolio_offset)))
+            a_haircut = max(inp_min_haircut, haircut)
+            j_pos = abs(((inp_quantity - x) * inp_price).clip(min=0).sum(axis=0)) + additional_j_long / SECTION_J_COEF
+            j_neg = abs(((inp_quantity - x) * inp_price).clip(max=0).sum(axis=0)) + additional_j_short / SECTION_J_COEF
+            j_haircut = (j_pos + j_neg - min(min(j_pos, j_neg), 0.25 * max(j_pos, j_neg))) * SECTION_J_COEF
+            return a_haircut + j_haircut
+
+
+        ##################################################################################################################
+        ##################################################################################################################
+        data = data.sort_values(['PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType'])
+        # data.loc[data['SecType']=='FUT', 'unit_price'] = 0
+        data['unit_price'] = data['unit_price'].replace(['NULL'], 0)
+        data['unit_price'] = data['unit_price'].fillna(0)
+
+        # for validations
+        val_cs_rows = len(data[data['SecType'] != 'OPT'])
+        val_cs_quantity = data[data['SecType'] != 'OPT']['quantity'].sum()
+
+        # split Portfolio-Product-Class
+        portfolio_set = list(set(data[(data['PrtfGrID'].notnull()) & (data['PrtfGrID'] != 'NULL')]['PrtfGrID']))
+        product_set = list(set(data[((data['PrtfGrID'].isnull()) | (data['PrtfGrID'] == 'NULL')) & (
+                    (data['ProdGrID'].notnull()) & (data['ProdGrID'] != 'NULL'))]['ProdGrID']))
+        class_set = list(set(data[((data['PrtfGrID'].isnull()) | (data['PrtfGrID'] == 'NULL')) & (
+                    (data['ProdGrID'].isnull()) | (data['ProdGrID'] == 'NULL'))]['ClassGrID']))
+
+        # skipped classes from optimizer
+        class_opt_count = data[data['SecType'] == 'OPT'][['ClassGrID', 'SecType']].groupby(['ClassGrID'],
+                                                                                           as_index=False).count()
+        class_opt_count = class_opt_count.rename({'SecType': 'Opt_count'}, axis=1)
+        data = data.merge(class_opt_count, on='ClassGrID', how='left').fillna(0)
+
+        data['Level'] = 3
+        data.loc[((data['PrtfGrID'].isnull()) | (data['PrtfGrID'] == 'NULL')) & (
+                    (data['ProdGrID'].notnull()) & (data['ProdGrID'] != 'NULL')), 'Level'] = 2
+        data.loc[(data['PrtfGrID'].notnull()) & (data['PrtfGrID'] != 'NULL'), 'Level'] = 1
+
+        data_skip = data[(data['Opt_count'] == 0) & (data['Level'] >= CLASS_WO_OPT_TO_J_FLAG)].copy()
+        data_skip['Q_ApA'] = 0
+        data_skip['Q_AtoM'] = data_skip['quantity']
+        data_skip['Haircut_Total'] = abs(data_skip['quantity']) * data_skip['unit_price'] * SECTION_J_COEF
+        data_skip['SkippedFromOptimizer'] = 'Y'
+        data = data[~((data['Opt_count'] == 0) & (data['Level'] >= CLASS_WO_OPT_TO_J_FLAG))].copy()
+
+        additional_j_long += (data_skip['Q_AtoM'][data_skip['Q_AtoM'] > 0] * data_skip['unit_price'][
+            data_skip['Q_AtoM'] > 0]).sum() * SECTION_J_COEF
+        additional_j_short += np.abs((data_skip['Q_AtoM'][data_skip['Q_AtoM'] < 0] * data_skip['unit_price'][
+            data_skip['Q_AtoM'] < 0]).sum() * SECTION_J_COEF)
+        additional_haircut = additional_j_long + additional_j_short - 0.25 * max(additional_j_long, additional_j_short)
+
+        result = pd.DataFrame(columns=['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType', 'Symbol',
+                                       'quantity', 'unit_price', 'Haircut_Total', 'SkippedFromOptimizer', 'Q_ApA',
+                                       'Q_AtoM'])
+        result_simplex = pd.DataFrame(columns=['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType', 'Symbol',
+                                               'quantity', 'unit_price'])
+
+        result = result.append(data_skip[['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                                          'Symbol', 'quantity', 'unit_price', 'Haircut_Total', 'SkippedFromOptimizer',
+                                          'Q_ApA', 'Q_AtoM']])
+
+        # portfolio
+        for pf in portfolio_set:
+            portfolio_count += 1
+            data_temp = data[data['PrtfGrID'] == pf].copy()
+            if len(data_temp[data_temp['SecType'] != 'OPT']) > 0:
+                start_time = time.time()
+                # FUT price to 0. But saving orig price for final results
+                unit_price_orig = data_temp['unit_price'].copy()
+                data_temp.loc[data_temp['SecType'] == 'FUT', 'unit_price'] = 0
+                inp_quantity = np.array(data_temp['quantity'])
+                inp_price = np.array(data_temp['unit_price'])
+                inp_pl_values = np.array(data_temp.filter(regex='PLV', axis=1))
+                inp_sec_type = np.array(data_temp['SecType'])
+                inp_min_haircut = data_temp['ClassGrMinHaircut'].sum()
+                inp_class = np.array(data_temp['ClassGrID'])
+                inp_class_number = len(np.unique(inp_class))
+                inp_product_offset_coef = np.array(
+                    data_temp[['ProdGrID', 'PrdGr_Offset']].groupby(['ProdGrID'], as_index=False).max()['PrdGr_Offset'])
+                inp_portfolio_offset_coef = data_temp['PrtfGr_Offset'].max()
+                if np.isnan(inp_portfolio_offset_coef) or inp_portfolio_offset_coef == 0: inp_portfolio_offset_coef = 1
+
+                class_prodact = data_temp[['ClassGrID', 'ProdGrID', 'PrdGr_Offset']]
+                class_prodact = class_prodact.groupby(['ClassGrID'], as_index=False).max()
+                class_prodact_dict = dict(zip(list(class_prodact['ClassGrID']), list(class_prodact['ProdGrID'])))
+                prodact_coef_dict = dict(zip(list(class_prodact['ProdGrID']), list(class_prodact['PrdGr_Offset'])))
+                for key, value in prodact_coef_dict.items():
+                    if np.isnan(value) or value == 0: prodact_coef_dict[key] = 1
+
+                x0 = []
+                for i, j in zip(inp_sec_type, inp_quantity):
+                    x0.append(j) if i == 'OPT' else x0.append(0)
+
+                bounds = []
+                for i, j in zip(inp_sec_type, inp_quantity):
+                    bounds.append((j - 0.00000001, j)) if i == 'OPT' else bounds.append((min(0, j), max(0, j)))
+
+                args = (inp_pl_values, inp_product_offset_coef, inp_portfolio_offset_coef, inp_min_haircut, inp_quantity,
+                        inp_price, class_prodact_dict, prodact_coef_dict, inp_class, inp_class_number, additional_j_long,
+                        additional_j_short)
+                model = dual_annealing(haircut_minimize, args=args, bounds=bounds, x0=x0)
+                data_temp = data_temp[data_temp['SecType'] != 'OPT'].copy()
+                data_temp['unit_price'] = unit_price_orig
+                data_temp['Haircut_Total'] = model.fun - additional_j_long - additional_j_short + 0.25 * max(
+                    additional_j_long, additional_j_short)
+                data_temp['SkippedFromOptimizer'] = 'N'
+                data_temp['Q_ApA'] = model.x[list(inp_sec_type != 'OPT')]
+                data_temp['Q_AtoM'] = data_temp['quantity'] - data_temp['Q_ApA']
+                result = result.append(data_temp[['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                                                  'Symbol', 'quantity', 'unit_price', 'Haircut_Total',
+                                                  'SkippedFromOptimizer', 'Q_ApA', 'Q_AtoM']])
+
+                portfolio_haircut += model.fun - additional_j_long - additional_j_short + 0.25 * max(additional_j_long,
+                                                                                                     additional_j_short)
+                additional_j_long += (result['Q_AtoM'][result['Q_AtoM'] > 0] * result['unit_price'][
+                    result['Q_AtoM'] > 0]).sum() * SECTION_J_COEF
+                additional_j_short += np.abs((result['Q_AtoM'][result['Q_AtoM'] < 0] * result['unit_price'][
+                    result['Q_AtoM'] < 0]).sum() * SECTION_J_COEF)
+
+                print(f'INFO Portfolio {pf} exec time = {round(time.time() - start_time, 2)} sec')
+
+        # class
+        start_time = time.time()
+        c, b_ub, b_eq, bounds, b_ub_J_long, b_ub_J_short, x_apa_extract, equities_number = [], [], [], [], [], [], [], 0
+        for i in class_set:
+            class_count += 1
+            data_temp = data[data['ClassGrID'] == i].copy()
+            if len(data_temp[data_temp['SecType'] != 'OPT']) > 0:
+                # FUT price to 0. But saving orig price for final results
+                unit_price_orig = data_temp['unit_price'].copy()
+                data_temp.loc[data_temp['SecType'] == 'FUT', 'unit_price'] = 0
+                options, equities, options_q, equities_q, equities_price, options_pp, equities_pp, \
+                classes, equity_classes, options_classes, min_haircut, product_coef = data_split(data_temp)
+                c_temp, A_ub_temp, b_ub_temp, A_eq_temp, b_eq_temp, bounds_temp, equities_number_temp, A_ub_J_long_temp, b_ub_J_long_temp, \
+                A_ub_J_short_temp, b_ub_J_short_temp = simplex_class(options, options_q, options_pp, equities, equities_q,
+                                                                     equities_pp, equities_price, SECTION_J_COEF,
+                                                                     min_haircut,
+                                                                     additional_j_long, additional_j_short)
+                if len(c) == 0:
+                    A_ub = A_ub_temp
+                    A_eq = A_eq_temp
+                    A_ub_J_long = A_ub_J_long_temp
+                    A_ub_J_short = A_ub_J_short_temp
+                else:
+                    A_ub = block_diag((A_ub, A_ub_temp))
+                    A_eq = block_diag((A_eq, A_eq_temp))
+                    A_ub_J_long = hstack((A_ub_J_long, A_ub_J_long_temp))
+                    A_ub_J_short = hstack((A_ub_J_short, A_ub_J_short_temp))
+
+                c += c_temp
+                b_ub += list(b_ub_temp)
+                b_eq += list(b_eq_temp)
+                b_ub_J_long = list(b_ub_J_long_temp)
+                b_ub_J_short = list(b_ub_J_short_temp)
+                bounds += bounds_temp
+                equities_number += equities_number_temp
+                x_apa_extract += [False, ] + [True] * equities_number_temp + [False] * equities_number_temp
+
+                data_temp = data_temp[data_temp['SecType'] != 'OPT'].copy()
+                data_temp['unit_price'] = unit_price_orig
+                result_simplex = result_simplex.append(
+                    data_temp[['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                               'Symbol', 'quantity', 'unit_price']])
+
+        # product
+        for i in product_set:
+            product_count += 1
+            data_temp = data[data['ProdGrID'] == i].copy()
+            if len(data_temp[data_temp['SecType'] != 'OPT']) > 0:
+                # FUT price to 0. But saving orig price for final results
+                unit_price_orig = data_temp['unit_price'].copy()
+                data_temp.loc[data_temp['SecType'] == 'FUT', 'unit_price'] = 0
+                options, equities, options_q, equities_q, equities_price, options_pp, equities_pp, \
+                classes, equity_classes, options_classes, min_haircut, product_coef = data_split(data_temp)
+                c_temp, A_ub_temp, b_ub_temp, A_eq_temp, b_eq_temp, bounds_temp, classes_number_temp, equities_number_temp, A_ub_J_long_temp, b_ub_J_long_temp, \
+                A_ub_J_short_temp, b_ub_J_short_temp = simplex_product(options, options_q, options_pp, equities, equities_q,
+                                                                       equities_pp, equities_price, SECTION_J_COEF,
+                                                                       min_haircut,
+                                                                       classes, equity_classes, options_classes,
+                                                                       additional_j_long, additional_j_short)
+
+                if len(c) == 0:
+                    A_ub = A_ub_temp
+                    A_eq = A_eq_temp
+                    A_ub_J_long = A_ub_J_long_temp
+                    A_ub_J_short = A_ub_J_short_temp
+                else:
+                    A_ub = block_diag((A_ub, A_ub_temp))
+                    A_eq = block_diag((A_eq, A_eq_temp))
+                    A_ub_J_long = hstack((A_ub_J_long, A_ub_J_long_temp))
+                    A_ub_J_short = hstack((A_ub_J_short, A_ub_J_short_temp))
+                c += c_temp
+                b_ub += list(b_ub_temp)
+                b_eq += list(b_eq_temp)
+                bounds += bounds_temp
+                b_ub_J_long = list(b_ub_J_long_temp)
+                b_ub_J_short = list(b_ub_J_short_temp)
+                equities_number += equities_number_temp
+                x_apa_extract += [False, ] + classes_number_temp * 10 * [False] + equities_number_temp * [
+                    True] + equities_number_temp * [False]
+
+                data_temp = data_temp[data_temp['SecType'] != 'OPT'].copy()
+                data_temp['unit_price'] = unit_price_orig
+                result_simplex = result_simplex.append(
+                    data_temp[['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                               'Symbol', 'quantity', 'unit_price']])
+
+        if len(c) > 0:
+            # J 25% optimization
+            c += [-1, ]
+            A_ub_len = A_ub.shape[0]
+            A_ub_long = vstack((A_ub, A_ub_J_long))
+            A_ub_long = hstack((A_ub_long, csr_matrix(np.array([0, ] * A_ub_len + [1, 1, 1, 0])[:, None])))
+            A_ub_short = vstack((A_ub, A_ub_J_short))
+            A_ub_short = hstack((A_ub_short, csr_matrix(np.array([0, ] * A_ub_len + [1, 1, 1, 0])[:, None])))
+            b_ub_long = b_ub + b_ub_J_long
+            b_ub_short = b_ub + b_ub_J_short
+            A_eq = hstack((A_eq, csr_matrix(np.array([0, ] * A_eq.shape[0])[:, None])))
+            bounds += [(0, None), ]
+            x_apa_extract += [False, ]
+
+            print(f'INFO Class-Product preprocessing exec time = {round(time.time() - start_time, 2)} sec')
+            start_time = time.time()
+
+            model_long = linprog(c=c,
+                                 A_ub=A_ub_long,
+                                 b_ub=b_ub_long,
+                                 A_eq=A_eq,
+                                 b_eq=b_eq,
+                                 bounds=bounds)
+
+            model_short = linprog(c=c,
+                                  A_ub=A_ub_short,
+                                  b_ub=b_ub_short,
+                                  A_eq=A_eq,
+                                  b_eq=b_eq,
+                                  bounds=bounds)
+            print(f'INFO Class-Product 2-side optimization exec time = {round(time.time() - start_time, 2)} sec')
+
+            if model_long.fun < model_short.fun:
+                class_product_haircut, x = model_long.fun + 0.25 * max(additional_j_long, additional_j_short), model_long.x
+            else:
+                class_product_haircut, x = model_short.fun + 0.25 * max(additional_j_long,
+                                                                        additional_j_short), model_short.x
+
+            result_simplex['Haircut_Total'] = class_product_haircut
+            result_simplex['SkippedFromOptimizer'] = 'N'
+            result_simplex['Q_ApA'] = x[x_apa_extract] * np.sign(result_simplex['quantity'])
+            result_simplex['Q_AtoM'] = result_simplex['quantity'] - result_simplex['Q_ApA']
+
+            result = result.append(result_simplex)
+
+        # post check
+        if val_cs_rows != len(result):
+            print('WARNING Number of CS&FUT raws != input-ouptput')
+        if round(val_cs_quantity - result['quantity'].sum(), 2) != 0:
+            print('WARNING Total quantity of CS&FUT != input-ouptput')
+        if round(result['Q_ApA'].sum() + result['Q_AtoM'].sum() - result['quantity'].sum(), 2) != 0:
+            print('WARNING Result Total quantity != Q_ApA + Q_AtoM')
+
+        print()
+        print('INFO Class groups processed', class_count)
+        print('INFO Product groups processed', product_count)
+        print('INFO Portfolio groups processed', portfolio_count)
+        print()
+        print('INFO Class-Product haircut', f'{class_product_haircut:,.0f}')
+        print('INFO Portfolio haircut', f'{portfolio_haircut:,.0f}')
+        print('INFO Additional haircut', f'{additional_haircut:,.0f}')
+
+        result['PrtfGrID'] = result['PrtfGrID'].replace({'NULL': None})
+        result['ProdGrID'] = result['ProdGrID'].replace({'NULL': '999'})
+        Optimization_Results = result
+else:
+    import warnings
+    import pandas as pd
+    import numpy as np
+    import scipy
+    import time
+    import sys
+    import cvxpy
+    import mip
+    import cvxpy.settings as s
+    from scipy.sparse import csr_matrix, vstack, hstack, block_diag, lil_matrix
+    from cvxpy.reductions.solvers.conic_solvers.cbc_conif import (CBC, dims_to_solver_dict)
+    from cvxpy.reductions.solvers.conic_solvers.conic_solver import ConicSolver
+    from cvxpy.reductions.solution import Solution, failure_solution
+
+    if len(data.index)==0:
+        result = pd.DataFrame(columns=['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType', 'Symbol',
+                                       'quantity', 'unit_price', 'Haircut_Total', 'SkippedFromOptimizer', 'Q_ApA',
+                                       'Q_AtoM'])
+        print("!!!!!!!!!EMPTY INPUT AGGREGATION!!!!!!!!!")
+        Optimization_Results = result
+    else:
+        warnings.simplefilter("ignore")
+
+        SECTION_J_COEF = 0.15
+        M = 500_000_000
+        additional_j_long = SECTION_J_COEF * sec_J['market_value_long'].sum()
+        additional_j_short = SECTION_J_COEF * np.abs(sec_J['market_value_short'].sum())
+
+        class_count, product_count, portfolio_count = (0, 0, 0)
+        class_product_haircut, portfolio_haircut = (0, 0)
+        portf_apa, class_apa = 0, 0
+
+        # skip optimization for classes wo options
+        CLASS_WO_OPT_TO_J_FLAG = 10
+        if '1' in str(CLASS_WO_OPT_TO_J_VAR):
+            CLASS_WO_OPT_TO_J_FLAG = 1
+        elif '2' in str(CLASS_WO_OPT_TO_J_VAR):
+            CLASS_WO_OPT_TO_J_FLAG = 2
+        elif '3' in str(CLASS_WO_OPT_TO_J_VAR):
+            CLASS_WO_OPT_TO_J_FLAG = 3
+        elif 'ALL' in str(CLASS_WO_OPT_TO_J_VAR):
+            CLASS_WO_OPT_TO_J_FLAG = 1
+
+        print('SYS python -v', sys.version.split(' ')[0])
+        print('SYS pandas -v', pd.__version__)
+        print('SYS numpy -v', np.__version__)
+        print('SYS scipy -v', scipy.__version__)
+        print('SYS mip -v', mip.__version__)
+        print('SYS cvxpy -v', cvxpy.__version__)
+        print()
+
+        ##################################################################################################################
+        ##################################################################################################################
+        start_time = time.time()
+
+
+        def data_split(data):
+            options = data[data['SecType'] == 'OPT']
+            equities = data[data['SecType'] != 'OPT']
+            options_q = np.array(options['quantity'])
+            equities_q = np.array(equities['quantity'])
+            equities_price = np.array(equities['unit_price'])
+            options_pp = np.array(options.filter(regex='PLV', axis=1))
+            equities_pp = np.array(equities.filter(regex='PLV', axis=1))
+            classes = np.array(data['ClassGrID'])
+            equity_classes = np.array(equities['ClassGrID'])
+            options_classes = np.array(options['ClassGrID'])
+            min_haircut = data['ClassGrMinHaircut'].sum()
+            product_coef = data['PrdGr_Offset'].max()
+            if np.isnan(product_coef) or product_coef == 0: product_coef = 1
+            return options, equities, options_q, equities_q, equities_price, options_pp, equities_pp, classes, equity_classes, options_classes, min_haircut, product_coef
+
+
+        def simplex_class(options, options_q, options_pp, equities, equities_q,
+                          equities_pp, equities_price, section_j_coef, min_haircut,
+                          additional_j_long, additional_j_short):
+
+            options_number = len(options_q)
+            equities_number = len(equities_q)
+
+            # objective function
+            c = [1, ] + equities_number * [0] + list(equities_price * section_j_coef)
+
+            # A_ub
+            # if q_cusip1 > 0 then -1*PP1 else PP1 end
+            equities_q_neg = np.where(equities_q > 0, (-1), 1)
+            equities_pp_neg = np.transpose(equities_pp) * equities_q_neg
+            # equities_pp_neg = equities_pp_neg * equities_q
+            A_ub = np.zeros(shape=(11, 1 + 2 * equities_number))
+            for i in range(10):
+                A_ub[i] = np.concatenate([np.array([-1]),
+                                          equities_pp_neg[i],
+                                          np.array(equities_number * [0])])
+            # add Cmin
+            A_ub[10] = np.array([-1, ] + equities_number * 2 * [0])
+
+            # b_ub
+            b_ub = np.array([])
+            for i in range(10):
+                temp_value = (options_pp[:, i] * options_q).sum()
+                b_ub = np.append(b_ub, temp_value)
+            # add Cmin
+            b_ub = np.append(b_ub, (-1) * min_haircut)
+
+            # A_eq and b_eq
+            A_eq = np.column_stack((np.array([0] * equities_number),
+                                    np.diag([1] * equities_number),
+                                    np.diag([1] * equities_number)))
+            b_eq = abs(equities_q)
+
+            bounds = [(0, None), ] + [(0, None)] * equities_number * 2
+
+            # section J
+            A_ub_J_long = np.vstack(([0, ] + equities_number * [0] + list(
+                np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * -1),
+                                     [0, ] + equities_number * [0] + list(
+                                         np.sign(equities_q * -1).clip(min=0) * equities_price * section_j_coef * -1),
+                                     [0, ] + equities_number * [0] + list(
+                                         np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * 0.25 * -1),
+                                     [0, ] + equities_number * [0] + list(
+                                         np.sign(equities_q * -1) * equities_price * section_j_coef)))
+
+            A_ub_J_short = np.vstack(([0, ] + equities_number * [0] + list(
+                np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * -1),
+                                      [0, ] + equities_number * [0] + list(
+                                          np.sign(equities_q * -1).clip(min=0) * equities_price * section_j_coef * -1),
+                                      [0, ] + equities_number * [0] + list(np.sign(equities_q * -1).clip(
+                                          min=0) * equities_price * section_j_coef * 0.25 * -1),
+                                      [0, ] + equities_number * [0] + list(
+                                          np.sign(equities_q) * equities_price * section_j_coef)))
+
+            b_ub_J_long = np.array([additional_j_long,
+                                    abs(additional_j_short),
+                                    0.25 * additional_j_long,
+                                    additional_j_long - abs(additional_j_short)])
+
+            b_ub_J_short = np.array([additional_j_long,
+                                     abs(additional_j_short),
+                                     0.25 * additional_j_short,
+                                     abs(additional_j_short) - additional_j_long])
+
+            return c, csr_matrix(A_ub), b_ub, csr_matrix(A_eq), b_eq, bounds, equities_number, csr_matrix(
+                A_ub_J_long), b_ub_J_long, csr_matrix(A_ub_J_short), b_ub_J_short
+
+
+        def simplex_product(options, options_q, options_pp, equities, equities_q,
+                            equities_pp, equities_price, section_j_coef, min_haircut,
+                            classes, equity_classes, options_classes,
+                            additional_j_long, additional_j_short):
+
+            options_number = len(options_q)
+            equities_number = len(equities_q)
+            classes_number = len(np.unique(classes))
+
+            class_equity_dict = {}
+            for cl in np.unique(equity_classes):
+                class_equity_dict[cl] = [i for i, x in enumerate(equity_classes) if x == cl]
+
+            class_option_dict = {}
+            for cl in np.unique(options_classes):
+                class_option_dict[cl] = [i for i, x in enumerate(options_classes) if x == cl]
+
+            # objective function
+            c = [1, ] + classes_number * 10 * [0] + equities_number * [0] + list(equities_price * section_j_coef)
+
+            # A_ub part 1
+            A_ub_1 = []
+            # 10 arrays for 10 PP
+            for i in range(10):
+                temp = [-1, ] + classes_number * i * [0] \
+                       + classes_number * [1] \
+                       + classes_number * (9 - i) * [0] \
+                       + equities_number * 2 * [0]
+                A_ub_1.append(temp)
+
+            # add Cmin
+            A_ub_1.append([-1, ] + classes_number * 10 * [0] + equities_number * 2 * [0])
+
+            # A_ub part 2
+            A_ub_2 = []
+            for k in [product_coef, 1]:
+                for cl, cl_name in enumerate(np.unique(classes)):
+                    for i, pp in enumerate(np.transpose(equities_pp)):
+                        t1 = [0] * classes_number * 10
+                        t1[i * classes_number + cl] = -1
+
+                        t2 = [0] * equities_number
+                        if cl_name in class_equity_dict:
+                            for pos in class_equity_dict[cl_name]:
+                                sign = 1 if equities_q[pos] < 0 else -1
+                                t2[pos] = float(pp[pos] * sign * k)
+
+                        t3 = [0] * equities_number
+
+                        temp = [0, ] + t1 + t2 + t3
+                        A_ub_2.append(temp)
+
+            # A_ub total
+            A_ub = A_ub_1 + A_ub_2
+
+            # b_ub
+            b_ub = [0] * 10 + [(-1) * min_haircut, ]
+
+            for k in [product_coef, 1]:
+                for cl, cl_name in enumerate(np.unique(classes)):
+                    for i in range(10):
+                        temp_value = 0
+                        if cl_name in class_option_dict:
+                            for pos in class_option_dict[cl_name]:
+                                temp_value += (options_pp[pos][i] * options_q[pos]).sum() * k
+                        b_ub = np.append(b_ub, temp_value)
+
+            # A_eq and b_eq
+            A_eq = np.column_stack((np.zeros([equities_number, classes_number * 10 + 1]),
+                                    np.diag([1] * equities_number),
+                                    np.diag([1] * equities_number)))
+            b_eq = abs(equities_q)
+
+            bounds = [(0, None)] + \
+                     [(None, None) for i in range(10 * classes_number)] + \
+                     [(0, None) for i in range(2 * equities_number)]
+            bounds_mip = [1, ] + \
+                         [0 for i in range(10 * classes_number)] + \
+                         [1 for i in range(2 * equities_number)]
+
+            # section J
+            A_ub_J_long = np.vstack(([0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * -1),
+                                     [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                         np.sign(equities_q * -1).clip(min=0) * equities_price * section_j_coef * -1),
+                                     [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                         np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * 0.25 * -1),
+                                     [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                         np.sign(equities_q * -1) * equities_price * section_j_coef)))
+
+            A_ub_J_short = np.vstack(([0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                np.sign(equities_q).clip(min=0) * equities_price * section_j_coef * -1),
+                                      [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                          np.sign(equities_q * -1).clip(min=0) * equities_price * section_j_coef * -1),
+                                      [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                          np.sign(equities_q * -1).clip(
+                                              min=0) * equities_price * section_j_coef * 0.25 * -1),
+                                      [0, ] + 10 * classes_number * [0] + equities_number * [0] + list(
+                                          np.sign(equities_q) * equities_price * section_j_coef)))
+
+            b_ub_J_long = np.array([additional_j_long,
+                                    abs(additional_j_short),
+                                    0.25 * additional_j_long,
+                                    additional_j_long - abs(additional_j_short)])
+
+            b_ub_J_short = np.array([additional_j_long,
+                                     abs(additional_j_short),
+                                     0.25 * additional_j_short,
+                                     abs(additional_j_short) - additional_j_long])
+
+            return c, csr_matrix(A_ub), b_ub, csr_matrix(
+                A_eq), b_eq, bounds_mip, classes_number, equities_number, csr_matrix(A_ub_J_long), b_ub_J_long, csr_matrix(
+                A_ub_J_short), b_ub_J_short
+
+
+        class CBC_ALG(CBC):
+            """An interface to the customized CBC solver"""
+
+            MIP_CAPABLE = True
+            SUPPORTED_CONSTRAINTS = ConicSolver.SUPPORTED_CONSTRAINTS
+
+            def name(self):
+                """The name of the solver."""
+                return "CBC_ALG"
+
+            def import_solver(self):
+                """Imports the solver."""
+                import mip
+
+            def accepts(self, problem):
+                """Can python-mip solve the problem?"""
+                if not problem.objective.args[0].is_affine():
+                    return False
+                for constr in problem.constraints:
+                    if type(constr) not in self.SUPPORTED_CONSTRAINTS:
+                        return False
+                    for arg in constr.args:
+                        if not arg.is_affine():
+                            return False
+                return True
+
+            def apply(self, problem):
+                """Returns a new problem and data for inverting the new solution"""
+                data, inv_data = super(CBC_ALG, self).apply(problem)
+                variables = problem.x
+                data[s.BOOL_IDX] = [int(t[0]) for t in variables.boolean_idx]
+                data[s.INT_IDX] = [int(t[0]) for t in variables.integer_idx]
+
+                return data, inv_data
+
+            def invert(self, solution, inverse_data):
+                """Returns the solution to the original problem given the inverse_data."""
+                status = solution["status"]
+
+                if status in s.SOLUTION_PRESENT:
+                    opt_val = solution["value"] + inverse_data[s.OFFSET]
+                    primal_vars = {inverse_data[self.VAR_ID]: solution["primal"]}
+                    return Solution(status, opt_val, primal_vars, None, {})
+                else:
+                    return failure_solution(status)
+
+            def solve_via_data(self, data, warm_start, verbose, solver_opts, solver_cache=None):
+                import mip
+
+                c = data[s.C]
+                b = data[s.B]
+                A = data[s.A]
+                dims = dims_to_solver_dict(data[s.DIMS])
+
+                n = c.shape[0]
+
+                # Problem
+                model = mip.Model()
+
+                # Variables
+                x = []
+                bool_idxs = set(data[s.BOOL_IDX])
+                int_idxs = set(data[s.INT_IDX])
+                for i in range(n):
+                    if i in bool_idxs:
+                        x.append(model.add_var(var_type=mip.BINARY))
+                    elif i in int_idxs:
+                        x.append(model.add_var(var_type=mip.INTEGER, lb=-mip.INF))
+                    else:
+                        x.append(model.add_var(lb=-mip.INF))
+
+                # Constraints
+                # eq
+                def add_eq_constraints(_model):
+                    coeffs = A[0: dims[s.EQ_DIM], :].tocsr()
+                    vals = b[0: dims[s.EQ_DIM]]
+                    indices, indptr, data = coeffs.indices, coeffs.indptr, coeffs.data
+                    for i in range(coeffs.shape[0]):
+                        col_idxs = indices[indptr[i]: indptr[i + 1]]
+                        row_vals = data[indptr[i]: indptr[i + 1]]
+                        vars = [x[j] for j in col_idxs]
+                        constr = mip.LinExpr(
+                            variables=vars,
+                            coeffs=row_vals.tolist(),
+                            const=-1 * vals[i],
+                            sense=mip.EQUAL,
+                        )
+                        _model.add_constr(constr)
+
+                add_eq_constraints(model)
+
+                # leq
+                def add_leq_constraints(_model):
+                    leq_start = dims[s.EQ_DIM]
+                    leq_end = dims[s.EQ_DIM] + dims[s.LEQ_DIM]
+                    # CSR format faster as we're going row by row:
+                    coeffs = A[leq_start:leq_end, :].tocsr()
+                    vals = b[leq_start:leq_end]
+                    indices, indptr, data = coeffs.indices, coeffs.indptr, coeffs.data
+                    for i in range(coeffs.shape[0]):
+                        col_idxs = indices[indptr[i]: indptr[i + 1]]
+                        row_vals = data[indptr[i]: indptr[i + 1]]
+                        vars = [x[j] for j in col_idxs]
+                        constr = mip.LinExpr(
+                            variables=vars,
+                            coeffs=row_vals.tolist(),
+                            const=-1 * vals[i],
+                            sense=mip.LESS_OR_EQUAL,
+                        )
+                        _model.add_constr(constr)
+
+                add_leq_constraints(model)
+
+                # Objective
+                obj_expr = mip.LinExpr(variables=x, coeffs=c.tolist())
+                model.objective = mip.minimize(obj_expr)
+
+                model.verbose = verbose
+                for key, value in solver_opts.items():
+                    setattr(model, key, value)
+
+                status = model.optimize()
+
+                status_map = {
+                    mip.OptimizationStatus.OPTIMAL: s.OPTIMAL,
+                    mip.OptimizationStatus.INFEASIBLE: s.INFEASIBLE,
+                    mip.OptimizationStatus.INT_INFEASIBLE: s.INFEASIBLE,
+                    mip.OptimizationStatus.NO_SOLUTION_FOUND: s.INFEASIBLE,
+                    mip.OptimizationStatus.ERROR: s.SOLVER_ERROR,
+                    mip.OptimizationStatus.UNBOUNDED: s.UNBOUNDED,
+                    mip.OptimizationStatus.CUTOFF: s.INFEASIBLE,
+                    mip.OptimizationStatus.FEASIBLE: s.OPTIMAL_INACCURATE,
+                    mip.OptimizationStatus.LOADED: s.SOLVER_ERROR,
+                }
+
+                solution = {
+                    "status": status_map[status],
+                    "primal": [var.x for var in x],
+                    "value": model.objective_value,
+                }
+
+                return solution
+
+
+        def data_split_pf(data):
+            """Data splitting for the Portfolio MIP matrices"""
+
+            inp_quantity = np.array(data['quantity'])
+            inp_price = np.array(data['unit_price'])
+            inp_pl_values = np.array(data.filter(regex='PLV', axis=1))
+            inp_sec_type = np.array(data['SecType'])
+            inp_min_haircut = data['ClassGrMinHaircut'].sum()
+            inp_class = np.array(data['ClassGrID'])
+            inp_class_number = len(np.unique(inp_class))
+            inp_product_offset_coef = np.array(
+                data[['ProdGrID', 'PrdGr_Offset']].groupby(['ProdGrID'], as_index=False).max()['PrdGr_Offset'])
+            inp_portfolio_offset_coef = data['PrtfGr_Offset'].max()
+            if np.isnan(inp_portfolio_offset_coef) or inp_portfolio_offset_coef == 0: inp_portfolio_offset_coef = 1
+
+            class_prodact = data[['ClassGrID', 'ProdGrID', 'PrdGr_Offset']]
+            class_prodact = class_prodact.groupby(['ClassGrID'], as_index=False).max()
+            class_prodact_dict = dict(zip(list(class_prodact['ClassGrID']), list(class_prodact['ProdGrID'])))
+            prodact_coef_dict = dict(zip(list(class_prodact['ProdGrID']), list(class_prodact['PrdGr_Offset'])))
+            for key, value in prodact_coef_dict.items():
+                if np.isnan(value) or value == 0: prodact_coef_dict[key] = 1
+
+            product_number = len(np.unique(data['ProdGrID']))
+            cs_pos = data[(data['quantity'] > 0) & (data['SecType'] != 'OPT')]
+            cs_neg = data[(data['quantity'] < 0) & (data['SecType'] != 'OPT')]
+            products = np.unique(data['ProdGrID'])
+            classes_per_product = data[['ClassGrID', 'ProdGrID']].groupby(['ProdGrID'], as_index=False).nunique()
+            portfolio_coef = data['PrtfGr_Offset'].max()
+
+            prod_opt_q = data[data['SecType'] == 'OPT'].groupby(['ProdGrID'], as_index=False).sum()[
+                ['ProdGrID', 'quantity']]
+            for pr in products:
+                if pr not in list(prod_opt_q['ProdGrID']):
+                    prod_opt_q.loc[len(prod_opt_q)] = [pr, 0]
+
+            options_all = data[(data['SecType'] == 'OPT')]
+            uniq_classes = np.array(class_prodact.sort_values(['ProdGrID', 'ClassGrID'])['ClassGrID'])
+
+            class_prodact_coef_dict = dict(zip(list(class_prodact['ClassGrID']), list(class_prodact['PrdGr_Offset'])))
+            for key, value in class_prodact_coef_dict.items():
+                if np.isnan(value) or value == 0: class_prodact_coef_dict[key] = 1
+
+            return inp_quantity, inp_price, inp_pl_values, inp_sec_type, inp_min_haircut, inp_class, inp_class_number, \
+                   inp_product_offset_coef, inp_portfolio_offset_coef, class_prodact, class_prodact_dict, prodact_coef_dict, product_number, \
+                   cs_pos, cs_neg, products, classes_per_product, portfolio_coef, prod_opt_q, options_all, uniq_classes, class_prodact_coef_dict
+
+
+        def mip_data_pred_pf(inp_quantity, inp_price, inp_pl_values, inp_sec_type, inp_min_haircut, inp_class,
+                             inp_class_number, \
+                             inp_product_offset_coef, inp_portfolio_offset_coef, class_prodact, class_prodact_dict,
+                             prodact_coef_dict, product_number, \
+                             cs_pos, cs_neg, products, classes_per_product, portfolio_coef, prod_opt_q, options_all,
+                             uniq_classes, class_prodact_coef_dict):
+            """Input matices preparation for the portfolio part of a MIP solver"""
+
+            # objective function
+            c = [1, ] + \
+                [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + \
+                [0, ] * (len(cs_pos) + len(cs_neg)) + \
+                list(cs_pos['unit_price'] * 0.15) + list(cs_neg['unit_price'] * 0.15) + \
+                [0, ] * product_number * 2 * 10  # b1 and b2
+            len_c = len(c)
+            len_cs = len(cs_pos) + len(cs_neg)
+
+            # constraint matrices
+            Alb_1 = np.zeros([10, len_c])
+            len_pp = product_number * 4 + inp_class_number * 3
+            for i in range(10):
+                Alb_1[i][0] = 1
+                Alb_1[i][len_pp * i + 1: len_pp * i + 1 + product_number] = -1
+
+            Alb_2 = []
+            for pr_number, _ in enumerate(products):
+                for i in range(10):
+                    Alb_2_temp = [0, ] * len_c
+                    Alb_2_temp[len_pp * i + 1 + pr_number] = 1
+                    Alb_2_temp[len_pp * i + 1 + product_number + pr_number] = -1
+                    Alb_2.append(Alb_2_temp)
+
+            Alb_3 = []
+            for pr_number, pr in enumerate(products):
+                for i in range(10):
+                    Alb_3_temp = [0, ] * len_c
+                    Alb_3_temp[len_pp * i + 1 + pr_number] = 1
+                    Alb_3_temp[len_pp * i + 1 + product_number + pr_number] = - portfolio_coef
+                    Alb_3.append(Alb_3_temp)
+
+            Alb_4 = [1, ] + [0, ] * (len_c - 1)
+
+            Alb_5 = []
+            classes_temp = 0
+            for pr_number, pr in enumerate(products):
+                num_classes = int(classes_per_product[classes_per_product['ProdGrID'] == pr]['ClassGrID'])
+                for i in range(10):
+                    Alb_5_temp = [0, ] * len_c
+                    Alb_5_temp[len_pp * i + 1 + product_number * 2 + pr_number] = 1
+                    Alb_5_temp[len_pp * i + 1 + product_number * 4 + classes_temp:
+                               len_pp * i + 1 + product_number * 4 + classes_temp + num_classes] = [-1, ] * num_classes
+                    Alb_5.append(Alb_5_temp)
+                classes_temp += num_classes
+
+            Alb_6 = []
+            for pr_number, pr in enumerate(products):
+                for i in range(10):
+                    Alb_6_temp = [0, ] * len_c
+                    Alb_6_temp[len_pp * i + 1 + product_number * 3 + pr_number] = -1
+                    Alb_6_temp[len_pp * 10 + 1 + len_cs * 2 + product_number * 2 * i + pr_number] = M
+                    Alb_6.append(Alb_6_temp)
+
+            Alb_7 = []
+            classes_temp = 0
+            for pr_number, pr in enumerate(products):
+                num_classes = int(classes_per_product[classes_per_product['ProdGrID'] == pr]['ClassGrID'])
+                for i in range(10):
+                    Alb_7_temp = [0, ] * len_c
+                    Alb_7_temp[len_pp * i + 1 + product_number * 3 + pr_number] = -1
+                    Alb_7_temp[len_pp * 10 + 1 + len_cs * 2 + product_number * 2 * i + product_number + pr_number] = M
+                    Alb_7_temp[len_pp * i + 1 + product_number * 4 + inp_class_number * 2 + classes_temp:
+                               len_pp * i + 1 + product_number * 4 + inp_class_number * 2 + classes_temp + num_classes] = [
+                                                                                                                              -1, ] * num_classes
+                    Alb_7.append(Alb_7_temp)
+                classes_temp += num_classes
+
+            Alb_8 = []
+            for cl_number, _ in enumerate(uniq_classes):
+                for i in range(10):
+                    Alb_8_temp = [0, ] * len_c
+                    Alb_8_temp[len_pp * i + 1 + product_number * 4 + cl_number] = 1
+                    Alb_8_temp[len_pp * i + 1 + product_number * 4 + inp_class_number + cl_number] = -1
+                    Alb_8.append(Alb_8_temp)
+
+            Alb_9 = []
+            for cl_number, cl in enumerate(uniq_classes):
+                prodact_coef = class_prodact_coef_dict[cl]
+                for i in range(10):
+                    Alb_9_temp = [0, ] * len_c
+                    Alb_9_temp[len_pp * i + 1 + product_number * 4 + cl_number] = 1
+                    Alb_9_temp[len_pp * i + 1 + product_number * 4 + inp_class_number + cl_number] = -prodact_coef
+                    Alb_9.append(Alb_9_temp)
+
+            Alb_10 = []
+            for cl_number, _ in enumerate(uniq_classes):
+                for i in range(10):
+                    Alb_10_temp = [0, ] * len_c
+                    Alb_10_temp[len_pp * i + 1 + product_number * 4 + inp_class_number + cl_number] = -1
+                    Alb_10_temp[len_pp * i + 1 + product_number * 4 + inp_class_number * 2 + cl_number] = 1
+                    Alb_10.append(Alb_10_temp)
+
+            Alb_11 = []
+            for cl_number, cl in enumerate(uniq_classes):
+                prodact_coef = class_prodact_coef_dict[cl]
+                for i in range(10):
+                    Alb_11_temp = [0, ] * len_c
+                    Alb_11_temp[len_pp * i + 1 + product_number * 4 + inp_class_number + cl_number] = -1 / prodact_coef
+                    Alb_11_temp[len_pp * i + 1 + product_number * 4 + inp_class_number * 2 + cl_number] = 1
+                    Alb_11.append(Alb_11_temp)
+
+            # H_adj_pos >=0
+            Alb_12 = []
+            for pr_number, pr in enumerate(products):
+                for i in range(10):
+                    Alb_12_temp = [0, ] * len_c
+                    Alb_12_temp[len_pp * i + 1 + product_number * 2 + pr_number] = 1
+                    Alb_12.append(Alb_12_temp)
+
+            # H_adj_neg >=0
+            Alb_13 = []
+            for pr_number, pr in enumerate(products):
+                for i in range(10):
+                    Alb_13_temp = [0, ] * len_c
+                    Alb_13_temp[len_pp * i + 1 + product_number * 3 + pr_number] = 1
+                    Alb_13.append(Alb_13_temp)
+
+            # q >=0
+            Alb_14 = []
+            for cs in range(len(cs_pos)):
+                Alb_14_temp = [0, ] * len_c
+                Alb_14_temp_2 = [0, ] * len_c
+                Alb_14_temp[1 + 10 * (product_number * 4 + inp_class_number * 3) + cs] = 1
+                Alb_14_temp_2[1 + 10 * (product_number * 4 + inp_class_number * 3) + len(cs_pos) + len(cs_neg) + cs] = 1
+                Alb_14.append(Alb_14_temp)
+                Alb_14.append(Alb_14_temp_2)
+            for cs in range(len(cs_neg)):
+                Alb_14_temp = [0, ] * len_c
+                Alb_14_temp_2 = [0, ] * len_c
+                Alb_14_temp[1 + 10 * (product_number * 4 + inp_class_number * 3) + len(cs_pos) + cs] = 1
+                Alb_14_temp_2[1 + 10 * (product_number * 4 + inp_class_number * 3) + len(cs_pos) * 2 + len(cs_neg) + cs] = 1
+                Alb_14.append(Alb_14_temp)
+                Alb_14.append(Alb_14_temp_2)
+
+            Alb = vstack(
+                (Alb_1, Alb_2, Alb_3, Alb_4, Alb_5, Alb_6, Alb_7, Alb_8, Alb_9, Alb_10, Alb_11, Alb_12, Alb_13, Alb_14))
+
+            b_Alb = [0, ] * 10 + \
+                    [0, ] * 10 * product_number * 2 + \
+                    [inp_min_haircut, ] + \
+                    [0, ] * 10 * product_number * 3 + \
+                    [0, ] * 10 * len(uniq_classes) * 4 + \
+                    [0, ] * 10 * product_number * 2 + \
+                    [0, ] * 2 * len_cs
+            b_Alb = np.array(b_Alb)
+
+            # b1 + b2 = 1
+            bool_constr_eq = []
+            for pr_number, pr in enumerate(products):
+                for i in range(10):
+                    bool_constr_eq_temp = [0, ] * len_c
+                    bool_constr_eq_temp[len_pp * 10 + 1 + len_cs * 2 + product_number * 2 * i + pr_number] = 1
+                    bool_constr_eq_temp[
+                        len_pp * 10 + 1 + len_cs * 2 + product_number * 2 * i + product_number + pr_number] = 1
+                    bool_constr_eq.append(bool_constr_eq_temp)
+            bool_constr_eq = np.array(bool_constr_eq)
+
+            # q_A + q_J = q
+            cs_constr_eq = []
+            for cs in range(len(cs_pos)):
+                cs_constr_eq_temp = [0, ] * len_c
+                cs_constr_eq_temp[1 + 10 * (product_number * 4 + inp_class_number * 3) + cs] = 1
+                cs_constr_eq_temp[1 + 10 * (product_number * 4 + inp_class_number * 3) + len(cs_pos) + len(cs_neg) + cs] = 1
+                cs_constr_eq.append(cs_constr_eq_temp)
+            for cs in range(len(cs_neg)):
+                cs_constr_eq_temp = [0, ] * len_c
+                cs_constr_eq_temp[1 + 10 * (product_number * 4 + inp_class_number * 3) + len(cs_pos) + cs] = 1
+                cs_constr_eq_temp[
+                    1 + 10 * (product_number * 4 + inp_class_number * 3) + len(cs_pos) * 2 + len(cs_neg) + cs] = 1
+                cs_constr_eq.append(cs_constr_eq_temp)
+            cs_constr_eq = np.array(cs_constr_eq)
+            b_cs_constr_eq = np.concatenate((np.array(cs_pos['quantity']), np.abs(np.array(cs_neg['quantity']))))
+
+            # h = h pos + h neg
+            h_constr = []
+            for pr_number, pr in enumerate(products):
+                for i in range(10):
+                    h_constr_temp = [0, ] * len_c
+                    h_constr_temp[len_pp * i + 1 + product_number + pr_number] = 1
+                    h_constr_temp[len_pp * i + 1 + product_number * 2 + pr_number] = -1
+                    h_constr_temp[len_pp * i + 1 + product_number * 3 + pr_number] = 1
+                    h_constr.append(h_constr_temp)
+            h_constr = np.array(h_constr)
+
+            # H - pp * q = pp * opt
+            unique_classes = uniq_classes
+            class_cs_dict = {}
+            for cl in unique_classes:
+                class_cs_dict[cl] = (np.isin(cs_pos['ClassGrID'], cl),
+                                     np.isin(cs_neg['ClassGrID'], cl))
+
+            pp_eq = []
+            b_pp_eq = []
+            for cl_num, cl in enumerate(unique_classes):
+                for i in range(10):
+                    pp_eq_temp = [0, ] * len_c
+                    pp_eq_temp[len_pp * i + 1 + product_number * 4 + inp_class_number + cl_num] = 1
+                    cs_part_temp = np.concatenate([cs_pos['PLV' + str(i + 1)] * class_cs_dict[cl][0],
+                                                   -1 * cs_neg['PLV' + str(i + 1)] * class_cs_dict[cl][1]])
+                    pp_eq_temp[len_pp * 10 + 1:
+                               len_pp * 10 + 1 + len_cs] = cs_part_temp
+
+                    b_pp_eq.append(sum(options_all[options_all['ClassGrID'] == cl]['PLV' + str(i + 1)] * \
+                                       -1 * options_all[options_all['ClassGrID'] == cl]['quantity']))
+                    pp_eq.append(pp_eq_temp)
+            pp_eq = np.array(pp_eq)
+
+            Aeq = vstack((bool_constr_eq, cs_constr_eq, h_constr, pp_eq))
+            Aeq = csr_matrix(Aeq)
+
+            b_Aeq = [1, ] * len(bool_constr_eq) + \
+                    list(b_cs_constr_eq) + \
+                    [0, ] * len(h_constr) + \
+                    list(b_pp_eq)
+            b_Aeq = np.array(b_Aeq)
+
+            # section J 25%
+            A_ub_PF_J_long = np.vstack(
+                ([1, 0, ] + [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + [0, ] * len_cs +
+                 list(-1 * cs_pos['unit_price'] * SECTION_J_COEF) + [0, ] * len(cs_neg) +
+                 [0, ] * product_number * 2 * 10,
+                 [1, 0, ] + [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + [0, ] * len_cs +
+                 [0, ] * len(cs_pos) + list(-1 * cs_neg['unit_price'] * SECTION_J_COEF) +
+                 [0, ] * product_number * 2 * 10,
+                 [1, 0, ] + [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + [0, ] * len_cs +
+                 list(-1 * 0.25 * cs_pos['unit_price'] * SECTION_J_COEF) + [0, ] * len(cs_neg) +
+                 [0, ] * product_number * 2 * 10,
+                 [0, 0, ] + [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + [0, ] * len_cs +
+                 list(-1 * cs_pos['unit_price'] * SECTION_J_COEF) + list(cs_neg['unit_price'] * SECTION_J_COEF) +
+                 [0, ] * product_number * 2 * 10))
+            A_ub_PF_J_short = np.vstack(
+                ([1, 0, ] + [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + [0, ] * len_cs +
+                 list(-1 * cs_pos['unit_price'] * SECTION_J_COEF) + [0, ] * len(cs_neg) +
+                 [0, ] * product_number * 2 * 10,
+                 [1, 0, ] + [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + [0, ] * len_cs +
+                 [0, ] * len(cs_pos) + list(-1 * cs_neg['unit_price'] * SECTION_J_COEF) +
+                 [0, ] * product_number * 2 * 10,
+                 [1, 0, ] + [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + [0, ] * len_cs +
+                 [0, ] * len(cs_pos) + list(-1 * 0.25 * cs_neg['unit_price'] * SECTION_J_COEF) +
+                 [0, ] * product_number * 2 * 10,
+                 [0, 0, ] + [0, ] * 10 * (product_number * 4 + inp_class_number * 3) + [0, ] * len_cs +
+                 list(cs_pos['unit_price'] * SECTION_J_COEF) + list(-1 * cs_neg['unit_price'] * SECTION_J_COEF) +
+                 [0, ] * product_number * 2 * 10))
+            b_ub_PF_J_long = np.array([additional_j_long,
+                                       abs(additional_j_short),
+                                       0.25 * additional_j_long,
+                                       additional_j_long - abs(additional_j_short)])
+            b_ub_PF_J_short = np.array([additional_j_long,
+                                        abs(additional_j_short),
+                                        0.25 * additional_j_short,
+                                        abs(additional_j_short) - additional_j_long])
+
+            return c, Alb, b_Alb, Aeq, b_Aeq, csr_matrix(A_ub_PF_J_long), csr_matrix(
+                A_ub_PF_J_short), b_ub_PF_J_long, b_ub_PF_J_short, product_number, inp_class_number, len_cs
+
+
+        ##############################################################################################################################################
+        ##############################################################################################################################################
+
+        data = data.sort_values(['PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType'])
+        data['unit_price'] = data['unit_price'].replace(['NULL'], 0)
+        data['unit_price'] = data['unit_price'].fillna(0)
+
+        # for validations
+        val_cs_rows = len(data[data['SecType'] != 'OPT'])
+        val_cs_quantity = data[data['SecType'] != 'OPT']['quantity'].sum()
+
+        # skipped classes wo OPT from optimizer
+        class_opt_count = data[data['SecType'] == 'OPT'][['ClassGrID', 'SecType']].groupby(['ClassGrID'],
+                                                                                           as_index=False).count()
+        class_opt_count = class_opt_count.rename({'SecType': 'Opt_count'}, axis=1)
+        data = data.merge(class_opt_count, on='ClassGrID', how='left')
+        data['Opt_count'] = data['Opt_count'].fillna(0)
+
+        data['Level'] = 3
+        data.loc[((data['PrtfGrID'].isnull()) | (data['PrtfGrID'] == 'NULL')) & (
+                    (data['ProdGrID'].notnull()) & (data['ProdGrID'] != 'NULL')), 'Level'] = 2
+        data.loc[(data['PrtfGrID'].notnull()) & (data['PrtfGrID'] != 'NULL'), 'Level'] = 1
+
+        data_skip = data[(data['Opt_count'] == 0) & (data['Level'] >= CLASS_WO_OPT_TO_J_FLAG)].copy()
+        data_skip['Q_ApA'] = 0
+        data_skip['Q_AtoM'] = data_skip['quantity']
+        data_skip['Haircut_Total'] = abs(data_skip['quantity']) * data_skip['unit_price'] * SECTION_J_COEF  # ?
+        data_skip['SkippedFromOptimizer'] = 'Y'
+        data = data[~((data['Opt_count'] == 0) & (data['Level'] >= CLASS_WO_OPT_TO_J_FLAG))].copy()
+
+        # split Portfolio-Product-Class
+        portfolio_set = list(set(data[(data['PrtfGrID'].notnull()) & (data['PrtfGrID'] != 'NULL')]['PrtfGrID']))
+        product_set = list(set(data[((data['PrtfGrID'].isnull()) | (data['PrtfGrID'] == 'NULL')) & (
+                    (data['ProdGrID'].notnull()) & (data['ProdGrID'] != 'NULL'))]['ProdGrID']))
+        class_set = list(set(data[((data['PrtfGrID'].isnull()) | (data['PrtfGrID'] == 'NULL')) & (
+                    (data['ProdGrID'].isnull()) | (data['ProdGrID'] == 'NULL'))]['ClassGrID']))
+
+        class_count = len(class_set)
+        product_count = len(product_set)
+        portfolio_count = len(portfolio_set)
+
+        data_class_prod = data[
+            ((data['PrtfGrID'].isnull()) | (data['PrtfGrID'] == 'NULL')) & (data['SecType'] != 'OPT')].copy()  # ?
+        cs_pp = np.array(data_class_prod.filter(regex='PLV', axis=1))  # ?
+        cs_q = data_class_prod['quantity']  # ?
+        cs_price = data_class_prod['unit_price']  # ?
+
+        additional_j_long += (data_skip['Q_AtoM'][data_skip['Q_AtoM'] > 0] * data_skip['unit_price'][
+            data_skip['Q_AtoM'] > 0]).sum() * SECTION_J_COEF
+        additional_j_short += np.abs((data_skip['Q_AtoM'][data_skip['Q_AtoM'] < 0] * data_skip['unit_price'][
+            data_skip['Q_AtoM'] < 0]).sum() * SECTION_J_COEF)
+
+        result = pd.DataFrame(columns=['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType', 'Symbol',
+                                       'quantity', 'unit_price', 'Haircut_Total', 'SkippedFromOptimizer', 'Q_ApA',
+                                       'Q_AtoM'])
+        result = result.append(data_skip[['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                                          'Symbol', 'quantity', 'unit_price', 'Haircut_Total', 'SkippedFromOptimizer',
+                                          'Q_ApA', 'Q_AtoM']])
+        result_mip = pd.DataFrame(columns=['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType', 'Symbol',
+                                           'quantity', 'unit_price'])
+
+        c_pf = []
+        x_apa_extract, non_neg = [], []
+        for pf in portfolio_set:
+            data_temp = data[data['PrtfGrID'] == pf].copy()
+            if len(data_temp[data_temp['SecType'] != 'OPT']) > 0:
+                result_mip = result_mip.append(data_temp[(data_temp['quantity'] > 0) & (data_temp['SecType'] != 'OPT')]
+                                               [['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                                                 'Symbol', 'quantity', 'unit_price']])
+                result_mip = result_mip.append(data_temp[(data_temp['quantity'] < 0) & (data_temp['SecType'] != 'OPT')]
+                                               [['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                                                 'Symbol', 'quantity', 'unit_price']])
+                data_temp.loc[data_temp['SecType'] == 'FUT', 'unit_price'] = 0
+
+                c_pf, Alb_pf, b_Alb_pf, Aeq_pf, b_Aeq_pf, A_ub_PF_J_long_pf, A_ub_PF_J_short_pf, b_ub_PF_J_long_pf, b_ub_PF_J_short_pf, \
+                product_number_pf, inp_class_number_pf, len_cs_pf = mip_data_pred_pf(*data_split_pf(data_temp))
+
+                x_apa_extract += [False, ] + [False, ] * 10 * (product_number_pf * 4 + inp_class_number_pf * 3) + \
+                                 [True, ] * len_cs_pf + [False, ] * len_cs_pf + [False, ] * product_number_pf * 2 * 10
+                non_neg += [0, ] * len(c_pf)
+
+        # class
+        c_cl_pr, b_ub, b_eq, b_ub_J_long, b_ub_J_short, equities_number = [], [], [], [], [], 0
+        for i in class_set:
+            data_temp = data[data['ClassGrID'] == i].copy()
+            if len(data_temp[data_temp['SecType'] != 'OPT']) > 0:
+                result_mip = result_mip.append(data_temp[data_temp['SecType'] != 'OPT']
+                                               [['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                                                 'Symbol', 'quantity', 'unit_price']])
+                data_temp.loc[data_temp['SecType'] == 'FUT', 'unit_price'] = 0
+                options, equities, options_q, equities_q, equities_price, options_pp, equities_pp, \
+                classes, equity_classes, options_classes, min_haircut, product_coef = data_split(data_temp)
+                c_temp, A_ub_temp, b_ub_temp, A_eq_temp, b_eq_temp, bounds_temp, equities_number_temp, A_ub_J_long_temp, b_ub_J_long_temp, \
+                A_ub_J_short_temp, b_ub_J_short_temp = simplex_class(options, options_q, options_pp, equities, equities_q,
+                                                                     equities_pp, equities_price, SECTION_J_COEF,
+                                                                     min_haircut,
+                                                                     additional_j_long, additional_j_short)
+                if len(c_cl_pr) == 0:
+                    A_ub = A_ub_temp
+                    A_eq = A_eq_temp
+                    A_ub_J_long = A_ub_J_long_temp
+                    A_ub_J_short = A_ub_J_short_temp
+                else:
+                    A_ub = block_diag((A_ub, A_ub_temp))
+                    A_eq = block_diag((A_eq, A_eq_temp))
+                    A_ub_J_long = hstack((A_ub_J_long, A_ub_J_long_temp))
+                    A_ub_J_short = hstack((A_ub_J_short, A_ub_J_short_temp))
+
+                c_cl_pr += c_temp
+                b_ub += list(b_ub_temp)
+                b_eq += list(b_eq_temp)
+                b_ub_J_long = list(b_ub_J_long_temp)
+                b_ub_J_short = list(b_ub_J_short_temp)
+                equities_number += equities_number_temp
+                x_apa_extract += [False, ] + [True] * equities_number_temp + [False] * equities_number_temp
+                non_neg += [1, ] * len(c_temp)
+
+        # product
+        for i in product_set:
+            data_temp = data[data['ProdGrID'] == i].copy()
+            if len(data_temp[data_temp['SecType'] != 'OPT']) > 0:
+                result_mip = result_mip.append(data_temp[data_temp['SecType'] != 'OPT']
+                                               [['stream_field', 'PrtfGrID', 'ProdGrID', 'ClassGrID', 'SecType',
+                                                 'Symbol', 'quantity', 'unit_price']])
+                data_temp.loc[data_temp['SecType'] == 'FUT', 'unit_price'] = 0
+                options, equities, options_q, equities_q, equities_price, options_pp, equities_pp, \
+                classes, equity_classes, options_classes, min_haircut, product_coef = data_split(data_temp)
+                c_temp, A_ub_temp, b_ub_temp, A_eq_temp, b_eq_temp, bounds_temp, classes_number_temp, equities_number_temp, A_ub_J_long_temp, b_ub_J_long_temp, \
+                A_ub_J_short_temp, b_ub_J_short_temp = simplex_product(options, options_q, options_pp, equities, equities_q,
+                                                                       equities_pp, equities_price, SECTION_J_COEF,
+                                                                       min_haircut,
+                                                                       classes, equity_classes, options_classes,
+                                                                       additional_j_long, additional_j_short)
+
+                if len(c_cl_pr) == 0:
+                    A_ub = A_ub_temp
+                    A_eq = A_eq_temp
+                    A_ub_J_long = A_ub_J_long_temp
+                    A_ub_J_short = A_ub_J_short_temp
+                else:
+                    A_ub = block_diag((A_ub, A_ub_temp))
+                    A_eq = block_diag((A_eq, A_eq_temp))
+                    A_ub_J_long = hstack((A_ub_J_long, A_ub_J_long_temp))
+                    A_ub_J_short = hstack((A_ub_J_short, A_ub_J_short_temp))
+                c_cl_pr += c_temp
+                b_ub += list(b_ub_temp)
+                b_eq += list(b_eq_temp)
+                b_ub_J_long = list(b_ub_J_long_temp)
+                b_ub_J_short = list(b_ub_J_short_temp)
+                equities_number += equities_number_temp
+                x_apa_extract += [False, ] + classes_number_temp * 10 * [False] + equities_number_temp * [
+                    True] + equities_number_temp * [False]
+                non_neg += bounds_temp
+
+        # combine portfolio and class_product parts
+        c = [-1, ] + c_pf + c_cl_pr
+        x_apa_extract = [False, ] + x_apa_extract
+        non_neg = np.array([1, ] + non_neg)
+        nonneg_constr = lil_matrix((np.count_nonzero(non_neg), len(non_neg)), dtype=np.int8)
+        for i, pos in enumerate(np.where(non_neg != 0)[0]):
+            nonneg_constr[i, pos] = 1
+
+        PF_EXIST = True if len(c_pf) > 0 else False
+        CL_PR_EXIST = True if len(c_cl_pr) > 0 else False
+
+        if PF_EXIST:
+            Alb_pf = hstack((Alb_pf, csr_matrix((Alb_pf.shape[0], len(c_cl_pr)), dtype=np.int8)))
+            Alb_pf = csr_matrix(hstack((np.array([0, ] * Alb_pf.shape[0])[:, None], Alb_pf)))
+            Aeq_pf = hstack((Aeq_pf, csr_matrix((Aeq_pf.shape[0], len(c_cl_pr)), dtype=np.int8)))
+            Aeq_pf = csr_matrix(hstack((np.array([0, ] * Aeq_pf.shape[0])[:, None], Aeq_pf)))
+
+        if CL_PR_EXIST:
+            A_ub = csr_matrix(hstack((csr_matrix((A_ub.shape[0], len(c_pf) + 1), dtype=np.int8), A_ub)))
+            A_eq = csr_matrix(hstack((csr_matrix((A_eq.shape[0], len(c_pf) + 1), dtype=np.int8), A_eq)))
+
+        if (PF_EXIST & CL_PR_EXIST):
+            A_ub_J_long = csr_matrix(hstack((A_ub_PF_J_long_pf, A_ub_J_long)))
+            A_ub_J_short = csr_matrix(hstack((A_ub_PF_J_short_pf, A_ub_J_short)))
+            b_ub_J_long = b_ub_PF_J_long_pf
+            b_ub_J_short = b_ub_PF_J_short_pf
+        if (PF_EXIST & (not CL_PR_EXIST)):
+            A_ub_J_long = A_ub_PF_J_long_pf
+            A_ub_J_short = A_ub_PF_J_short_pf
+            b_ub_J_long = b_ub_PF_J_long_pf
+            b_ub_J_short = b_ub_PF_J_short_pf
+        if ((not PF_EXIST) & CL_PR_EXIST):
+            A_ub_J_long = csr_matrix(hstack((csr_matrix(np.array([1, 1, 1, 0])[:, None]), A_ub_J_long)))
+            A_ub_J_short = csr_matrix(hstack((csr_matrix(np.array([1, 1, 1, 0])[:, None]), A_ub_J_short)))
+            b_ub_J_long = b_ub_J_long
+            b_ub_J_short = b_ub_J_short
+
+        """#Modeling"""
+
+        # variables
+        if PF_EXIST:
+            var_float_pf_len = 1 + len(c_pf) - 10 * 2 * product_number_pf
+            var_bool_pf_len = 10 * 2 * product_number_pf
+            var_float_pf = cvxpy.Variable(var_float_pf_len)
+            var_bool_pf = cvxpy.Variable(var_bool_pf_len, boolean=True)
+        if CL_PR_EXIST:
+            var_float_cl_len = len(c_cl_pr) if len(c_pf) > 0 else len(c_cl_pr) + 1
+            var_float_cl = cvxpy.Variable(var_float_cl_len)
+
+        # objective function and constraints
+        if (PF_EXIST & CL_PR_EXIST):
+            c_fun = c[0:var_float_pf_len] * var_float_pf + \
+                    c[var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf + \
+                    c[
+                    var_float_pf_len + var_bool_pf_len:var_float_pf_len + var_bool_pf_len + var_float_cl_len] * var_float_cl
+            nonneg_constraint = nonneg_constr[:, 0:var_float_pf_len] * var_float_pf + \
+                                nonneg_constr[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf + \
+                                nonneg_constr[:,
+                                var_float_pf_len + var_bool_pf_len:var_float_pf_len + var_bool_pf_len + var_float_cl_len] * var_float_cl >= 0
+            lower_constraint_pf = Alb_pf[:, 0:var_float_pf_len] * var_float_pf + \
+                                  Alb_pf[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf + \
+                                  Alb_pf[:,
+                                  var_float_pf_len + var_bool_pf_len:var_float_pf_len + var_bool_pf_len + var_float_cl_len] * var_float_cl >= b_Alb_pf
+            eq_constraint_pf = Aeq_pf[:, 0:var_float_pf_len] * var_float_pf + \
+                               Aeq_pf[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf + \
+                               Aeq_pf[:,
+                               var_float_pf_len + var_bool_pf_len:var_float_pf_len + var_bool_pf_len + var_float_cl_len] * var_float_cl == b_Aeq_pf
+            upper_constraint_cl = A_ub[:, 0:var_float_pf_len] * var_float_pf + \
+                                  A_ub[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf + \
+                                  A_ub[:,
+                                  var_float_pf_len + var_bool_pf_len:var_float_pf_len + var_bool_pf_len + var_float_cl_len] * var_float_cl <= b_ub
+            eq_constraint_cl = A_eq[:, 0:var_float_pf_len] * var_float_pf + \
+                               A_eq[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf + \
+                               A_eq[:,
+                               var_float_pf_len + var_bool_pf_len:var_float_pf_len + var_bool_pf_len + var_float_cl_len] * var_float_cl == b_eq
+            j_long_constraint = A_ub_J_long[:, 0:var_float_pf_len] * var_float_pf + \
+                                A_ub_J_long[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf + \
+                                A_ub_J_long[:,
+                                var_float_pf_len + var_bool_pf_len:var_float_pf_len + var_bool_pf_len + var_float_cl_len] * var_float_cl <= b_ub_J_long
+            j_short_constraint = A_ub_J_short[:, 0:var_float_pf_len] * var_float_pf + \
+                                 A_ub_J_short[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf + \
+                                 A_ub_J_short[:,
+                                 var_float_pf_len + var_bool_pf_len:var_float_pf_len + var_bool_pf_len + var_float_cl_len] * var_float_cl <= b_ub_J_short
+            constraints_long = [nonneg_constraint, lower_constraint_pf, eq_constraint_pf, upper_constraint_cl,
+                                eq_constraint_cl, j_long_constraint]
+            constraints_short = [nonneg_constraint, lower_constraint_pf, eq_constraint_pf, upper_constraint_cl,
+                                 eq_constraint_cl, j_short_constraint]
+        if (PF_EXIST & (not CL_PR_EXIST)):
+            c_fun = c[0:var_float_pf_len] * var_float_pf + \
+                    c[var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf
+            nonneg_constraint = nonneg_constr[:, 0:var_float_pf_len] * var_float_pf + \
+                                nonneg_constr[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf >= 0
+            lower_constraint_pf = Alb_pf[:, 0:var_float_pf_len] * var_float_pf + \
+                                  Alb_pf[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf >= b_Alb_pf
+            eq_constraint_pf = Aeq_pf[:, 0:var_float_pf_len] * var_float_pf + \
+                               Aeq_pf[:, var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf == b_Aeq_pf
+            j_long_constraint = A_ub_J_long[:, 0:var_float_pf_len] * var_float_pf + \
+                                A_ub_J_long[:,
+                                var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf <= b_ub_J_long
+            j_short_constraint = A_ub_J_short[:, 0:var_float_pf_len] * var_float_pf + \
+                                 A_ub_J_short[:,
+                                 var_float_pf_len:var_float_pf_len + var_bool_pf_len] * var_bool_pf <= b_ub_J_short
+            constraints_long = [nonneg_constraint, lower_constraint_pf, eq_constraint_pf, j_long_constraint]
+            constraints_short = [nonneg_constraint, lower_constraint_pf, eq_constraint_pf, j_short_constraint]
+        if ((not PF_EXIST) & CL_PR_EXIST):
+            c_fun = c * var_float_cl
+            nonneg_constraint = nonneg_constr * var_float_cl >= 0
+            upper_constraint_cl = A_ub * var_float_cl <= b_ub
+            eq_constraint_cl = A_eq * var_float_cl == b_eq
+            j_long_constraint = A_ub_J_long * var_float_cl <= b_ub_J_long
+            j_short_constraint = A_ub_J_short * var_float_cl <= b_ub_J_short
+            constraints_long = [nonneg_constraint, upper_constraint_cl, eq_constraint_cl, j_long_constraint]
+            constraints_short = [nonneg_constraint, upper_constraint_cl, eq_constraint_cl, j_short_constraint]
+        print(f'INFO Preprocessing exec time = {round(time.time() - start_time, 2)} sec')
+
+        start_time = time.time()
+
+        model_long = cvxpy.Problem(cvxpy.Minimize(c_fun), constraints_long)
+        model_short = cvxpy.Problem(cvxpy.Minimize(c_fun), constraints_short)
+        model_long.solve(solver=CBC_ALG())
+        model_short.solve(solver=CBC_ALG())
+        if model_long.value < model_short.value:
+            haircut, x_dict, status = model_long.value + additional_j_long + additional_j_short, model_long.solution.primal_vars, model_long.status
+        else:
+            haircut, x_dict, status = model_short.value + additional_j_long + additional_j_short, model_short.solution.primal_vars, model_short.status
+        x = np.array([])
+        for _, value in x_dict.items():
+            x = np.concatenate((x, value))
+
+        print(f'INFO MIP model exec time = {round(time.time() - start_time, 2)} sec')
+        print(f'INFO MIP model value = {haircut:,.0f}, status = {model_short.status}')
+
+        result_mip['Haircut_Total'] = haircut
+        result_mip['SkippedFromOptimizer'] = 'N'
+        result_mip['Q_ApA'] = x[x_apa_extract] * np.sign(result_mip['quantity'])
+        result_mip['Q_AtoM'] = result_mip['quantity'] - result_mip['Q_ApA']
+        result = result.append(result_mip)
+        result['Haircut_Total'] = haircut
+
+        # post check
+        if val_cs_rows != len(result):
+            print('WARNING Number of CS&FUT raws != input-ouptput')
+        if round(val_cs_quantity - result['quantity'].sum(), 2) != 0:
+            print('WARNING Total quantity of CS&FUT != input-ouptput')
+        if round((result['Q_ApA'] + result['Q_AtoM'] - result['quantity']).sum(), 2) != 0:
+            print('WARNING Result Total quantity != Q_ApA + Q_AtoM')
+
+        print()
+        print('INFO Class groups processed', class_count)
+        print('INFO Product groups processed', product_count)
+        print('INFO Portfolio groups processed', portfolio_count)
+
+        result['PrtfGrID'] = result['PrtfGrID'].replace({'NULL': None})
+        result['ProdGrID'] = result['ProdGrID'].replace({'NULL': '999'})
+        Optimization_Results = result
